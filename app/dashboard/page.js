@@ -1,0 +1,283 @@
+'use client';
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { supabase } from '../lib/supabaseClient';
+import { Download, FileText, Calendar, LogOut, CheckCircle } from 'lucide-react';
+import { getXmlNFCeAction, getXmlNFSeAction, getPdfNFeAction, getPdfNFSeAction } from '../actions/fiscal';
+
+export default function DashboardPage() {
+    const router = useRouter();
+    const [loading, setLoading] = useState(true);
+    const [invoices, setInvoices] = useState([]);
+    const [period, setPeriod] = useState(new Date().toISOString().slice(0, 7)); // YYYY-MM
+    const [stats, setStats] = useState({ totalInfo: 0, totalValue: 0 });
+    const [downloading, setDownloading] = useState(null); // ID da nota sendo baixada
+    const [downloadType, setDownloadType] = useState(null); // 'xml' ou 'pdf'
+    const [userName, setUserName] = useState('');
+    const [orgName, setOrgName] = useState('');
+
+    useEffect(() => {
+        checkAuth();
+    }, [period]);
+
+    const checkAuth = async () => {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) {
+            router.push('/');
+            return;
+        }
+
+        // Fetch User & Logic
+        await fetchData(session.user.id);
+    };
+
+    const fetchData = async (userId) => {
+        setLoading(true);
+        try {
+            // Get Organization ID
+            const { data: user, error: userError } = await supabase
+                .from('app_users')
+                .select('organization_id, name, organizations(nome_fantasia)')
+                .eq('auth_id', userId)
+                .single();
+
+            if (userError || !user) {
+                console.error('User not found linked to organization');
+                return;
+            }
+
+            setUserName(user.name);
+            setOrgName(user.organizations?.nome_fantasia);
+            const orgId = user.organization_id;
+
+            // Calculate start and end of month
+            const [year, month] = period.split('-');
+            const startDate = `${year}-${month}-01`;
+            const endDate = new Date(year, month, 0).toISOString().split('T')[0];
+
+            // Fetch Sales
+            const { data, error } = await supabase
+                .from('sales')
+                .select('*, clients(name)')
+                .eq('organization_id', orgId)
+                .gte('created_at', `${startDate}T00:00:00`)
+                .lte('created_at', `${endDate}T23:59:59`)
+                .not('nfe_id', 'is', null)
+                .order('created_at', { ascending: false });
+
+            if (error) throw error;
+
+            const validInvoices = data;
+            setInvoices(validInvoices);
+
+            const total = validInvoices.reduce((acc, curr) => acc + (parseFloat(curr.total) || 0), 0);
+            setStats({
+                totalInfo: validInvoices.length,
+                totalValue: total
+            });
+
+        } catch (err) {
+            console.error('Data fetch error:', err);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleDownload = async (invoice, type = 'xml') => {
+        setDownloading(invoice.id);
+        setDownloadType(type);
+        try {
+            const ref = invoice.nfe_id; 
+            // Determina se é serviço (NFSe) ou produto (NFe/NFCe)
+            // Se não tiver campo 'type' explícito no banco, assumimos produto por padrão ou tentamos ambos?
+            // O ideal é ter um campo. Vamos assumir que se invoice.type === 'service' é serviço.
+            const isService = invoice.type === 'service' || invoice.modelo === 'nfse'; 
+
+            let result;
+            if (type === 'xml') {
+                result = isService 
+                    ? await getXmlNFSeAction(ref)
+                    : await getXmlNFCeAction(ref);
+            } else {
+                // PDF
+                result = isService
+                    ? await getPdfNFSeAction(ref)
+                    : await getPdfNFeAction(ref);
+            }
+
+            if (result.success && result.data) {
+                if (type === 'xml') {
+                    const xmlContent = result.data.raw || result.data;
+                    const blob = new Blob([xmlContent], { type: 'application/xml' });
+                    downloadBlob(blob, `${isService ? 'NFSe' : 'NFe'}-${ref}.xml`);
+                } else {
+                    // PDF (Base64)
+                    if (result.data.base64) {
+                        const blob = base64ToBlob(result.data.base64, 'application/pdf');
+                        downloadBlob(blob, `${isService ? 'NFSe' : 'NFe'}-${ref}.pdf`);
+                    } else {
+                         // Fallback se vier URL
+                         alert('PDF gerado, mas formato inesperado. Verifique console.');
+                         console.log('PDF Result:', result);
+                    }
+                }
+            } else {
+                alert(`Erro ao baixar ${type.toUpperCase()}: ` + (result.error || 'Conteúdo não retornado'));
+            }
+
+        } catch (err) {
+            console.error(err);
+            alert('Erro ao processar download.');
+        } finally {
+            setDownloading(null);
+            setDownloadType(null);
+        }
+    };
+
+    const base64ToBlob = (base64, type) => {
+        const byteCharacters = atob(base64);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        return new Blob([byteArray], { type });
+    }
+
+    const downloadBlob = (blob, filename) => {
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        window.URL.revokeObjectURL(url);
+    }
+
+    const handleLogout = async () => {
+        await supabase.auth.signOut();
+        router.push('/');
+    };
+
+    return (
+        <div style={{ minHeight: '100vh', background: '#f5f7fa', fontFamily: 'system-ui, sans-serif' }}>
+            {/* Header */}
+            <header style={{ background: 'white', borderBottom: '1px solid #e5e7eb', padding: '1rem 2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                    <div style={{ background: '#4338ca', width: '36px', height: '36px', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <FileText size={20} color="white" />
+                    </div>
+                    <div>
+                        <h1 style={{ fontSize: '1.25rem', fontWeight: '700', color: '#111827', lineHeight: 1.2 }}>Portal do Contador</h1>
+                        <p style={{ fontSize: '0.8rem', color: '#6b7280', margin: 0 }}>{orgName || 'Carregando...'} • {userName}</p>
+                    </div>
+                </div>
+                <button onClick={handleLogout} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#dc2626', background: 'none', border: 'none', fontWeight: '500', cursor: 'pointer', padding: '0.5rem 1rem', borderRadius: '6px', transition: 'background 0.2s' }}>
+                    <LogOut size={18} /> Sair
+                </button>
+            </header>
+
+            <main style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
+
+                {/* Stats */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem', marginBottom: '2rem' }}>
+                    <div style={{ background: '#fff', padding: '1.5rem', borderRadius: '12px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)', border: '1px solid #e5e7eb' }}>
+                        <p style={{ color: '#6b7280', fontSize: '0.875rem', fontWeight: '500', marginBottom: '0.5rem' }}>Notas Emitidas ({period})</p>
+                        <p style={{ fontSize: '2rem', fontWeight: '700', color: '#111827' }}>{stats.totalInfo}</p>
+                    </div>
+                    <div style={{ background: '#fff', padding: '1.5rem', borderRadius: '12px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)', border: '1px solid #e5e7eb' }}>
+                        <p style={{ color: '#6b7280', fontSize: '0.875rem', fontWeight: '500', marginBottom: '0.5rem' }}>Valor Total</p>
+                        <p style={{ fontSize: '2rem', fontWeight: '700', color: '#059669' }}>{stats.totalValue.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</p>
+                    </div>
+                </div>
+
+                {/* Main Table Card */}
+                <div style={{ background: '#fff', borderRadius: '12px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)', border: '1px solid #e5e7eb', overflow: 'hidden' }}>
+
+                    {/* Toolbar */}
+                    <div style={{ padding: '1.5rem', borderBottom: '1px solid #e5e7eb', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+                        <h2 style={{ fontSize: '1.125rem', fontWeight: '600', color: '#111827' }}>Notas Fiscais Emitidas</h2>
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: '#f9fafb', padding: '0.5rem 1rem', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
+                            <Calendar size={18} color="#6b7280" />
+                            <input
+                                type="month"
+                                value={period}
+                                onChange={(e) => setPeriod(e.target.value)}
+                                style={{ border: 'none', background: 'transparent', outline: 'none', fontSize: '0.9rem', color: '#374151', fontFamily: 'inherit' }}
+                            />
+                        </div>
+                    </div>
+
+                    {/* Table */}
+                    <div style={{ overflowX: 'auto' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.875rem' }}>
+                            <thead>
+                                <tr style={{ background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
+                                    <th style={{ padding: '1rem 1.5rem', fontWeight: '600', color: '#374151' }}>Emissão</th>
+                                    <th style={{ padding: '1rem 1.5rem', fontWeight: '600', color: '#374151' }}>Tipo</th>
+                                    <th style={{ padding: '1rem 1.5rem', fontWeight: '600', color: '#374151' }}>Referência</th>
+                                    <th style={{ padding: '1rem 1.5rem', fontWeight: '600', color: '#374151' }}>Cliente</th>
+                                    <th style={{ padding: '1rem 1.5rem', fontWeight: '600', color: '#374151' }}>Valor</th>
+                                    <th style={{ padding: '1rem 1.5rem', fontWeight: '600', color: '#374151' }}>Status</th>
+                                    <th style={{ padding: '1rem 1.5rem', fontWeight: '600', color: '#374151', textAlign: 'right' }}>Ações</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {loading ? (
+                                    <tr><td colSpan="7" style={{ padding: '3rem', textAlign: 'center', color: '#6b7280' }}>Carregando dados...</td></tr>
+                                ) : invoices.length === 0 ? (
+                                    <tr><td colSpan="7" style={{ padding: '3rem', textAlign: 'center', color: '#6b7280' }}>Nenhuma nota encontrada no período selecionado.</td></tr>
+                                ) : (
+                                    invoices.map(invoice => (
+                                        <tr key={invoice.id} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                                            <td style={{ padding: '1rem 1.5rem', color: '#111827' }}>
+                                                {new Date(invoice.created_at).toLocaleDateString('pt-BR')} <span style={{ color: '#9ca3af', fontSize: '0.8rem' }}>{new Date(invoice.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</span>
+                                            </td>
+                                            <td style={{ padding: '1rem 1.5rem' }}>
+                                                <span style={{ 
+                                                    fontSize: '0.7rem', fontWeight: '700', padding: '0.15rem 0.5rem', borderRadius: '4px',
+                                                    background: (invoice.type === 'service' || invoice.modelo === 'nfse') ? '#e0e7ff' : '#fff7ed',
+                                                    color: (invoice.type === 'service' || invoice.modelo === 'nfse') ? '#3730a3' : '#9a3412'
+                                                }}>
+                                                    {(invoice.type === 'service' || invoice.modelo === 'nfse') ? 'NFSe' : 'NFe/NFCe'}
+                                                </span>
+                                            </td>
+                                            <td style={{ padding: '1rem 1.5rem', fontFamily: 'ui-monospace, monospace', color: '#4b5563' }}>{invoice.nfe_id || '-'}</td>
+                                            <td style={{ padding: '1rem 1.5rem', fontWeight: '500', color: '#111827' }}>{invoice.clients?.name || 'Cliente Final'}</td>
+                                            <td style={{ padding: '1rem 1.5rem', color: '#111827' }}>{parseFloat(invoice.total || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</td>
+                                            <td style={{ padding: '1rem 1.5rem' }}>
+                                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.25rem', background: '#dcfce7', color: '#166534', padding: '0.25rem 0.625rem', borderRadius: '9999px', fontSize: '0.75rem', fontWeight: '600' }}>
+                                                    <CheckCircle size={12} /> AUTORIZADA
+                                                </span>
+                                            </td>
+                                            <td style={{ padding: '1rem 1.5rem', textAlign: 'right' }}>
+                                                <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                                                    <button
+                                                        onClick={() => handleDownload(invoice, 'xml')}
+                                                        disabled={downloading === invoice.id}
+                                                        title="Baixar XML"
+                                                        style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem', border: '1px solid #d1d5db', borderRadius: '6px', background: 'white', color: '#374151', cursor: 'pointer', transition: 'all 0.2s' }}
+                                                    >
+                                                        {downloading === invoice.id && downloadType === 'xml' ? '...' : <><code style={{fontWeight:'bold', fontSize:'0.7rem'}}>XML</code></>}
+                                                    </button>
+                                                    <button
+                                                        onClick={() => handleDownload(invoice, 'pdf')}
+                                                        disabled={downloading === invoice.id}
+                                                        title="Baixar PDF (DANFE)"
+                                                        style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem', border: '1px solid #d1d5db', borderRadius: '6px', background: 'white', color: '#374151', cursor: 'pointer', transition: 'all 0.2s' }}
+                                                    >
+                                                        {downloading === invoice.id && downloadType === 'pdf' ? '...' : <><Download size={14} /></>}
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    ))
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </main>
+        </div>
+    );
+}

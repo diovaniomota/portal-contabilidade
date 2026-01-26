@@ -1,0 +1,19 @@
+$path = "..\next-dashboard\app\configuracoes\page.js"
+$content = Get-Content -Path $path -Raw -Encoding UTF8
+
+$replacements = @{
+    "ConfiguraÃ§Ã£o" = "Configuração"
+    "ProvisÃ³rio" = "Provisório"
+    "ServiÃ§os" = "Serviços"
+    "HomologaÃ§Ã£o" = "Homologação"
+    "ProduÃ§Ã£o" = "Produção"
+    "SÃ©rie" = "Série"
+    "PrÃ³ximo" = "Próximo"
+}
+
+foreach ($key in $replacements.Keys) {
+    $content = $content.Replace($key, $replacements[$key])
+}
+
+Set-Content -Path $path -Value $content -Encoding UTF8
+Write-Host "Encoding fixed."
