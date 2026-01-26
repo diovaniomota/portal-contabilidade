@@ -934,7 +934,7 @@ export async function updateFiscalSettingsAction(data) {
     if (data.login_prefeitura) {
         const login = String(data.login_prefeitura).trim();
         payload.login_prefeitura = login;
-        payload.iss_usuario = login; 
+        payload.iss_usuario = login;
         payload.usuario_nfse = login;
         payload.login_responsavel = login; // Campo identificado via diagnóstico
     }
@@ -1077,33 +1077,85 @@ export async function getCertificateInfoAction(cnpj) {
 }
 
 async function downloadPdfFromUrl(url) {
-     const absoluteUrl = normalizeFocusUrl(url);
-     const res = await fetch(absoluteUrl);
-     if (!res.ok) throw new Error('Falha ao baixar PDF');
-     const ab = await res.arrayBuffer();
-     const base64 = Buffer.from(ab).toString('base64');
-     return { success: true, data: { base64 } };
+    const absoluteUrl = normalizeFocusUrl(url);
+    const res = await fetch(absoluteUrl);
+    if (!res.ok) throw new Error('Falha ao baixar PDF');
+    const ab = await res.arrayBuffer();
+    const base64 = Buffer.from(ab).toString('base64');
+    return { success: true, data: { base64 } };
 }
 
 /**
  * Obter XML da NFSe
  */
-export async function getXmlNFSeAction(ref) {
+/**
+ * Obter XML da NFSe
+ */
+export async function getXmlNFSeAction(rawRef, snapshot = null) {
+    const ref = rawRef?.trim();
+    console.log(`[getXmlNFSeAction] Start for ref: "${ref}"`);
+
     try {
-        // Tenta obter o XML diretamente
-        // Focus NFe geralmente usa .xml no final para XML
-        try {
-            const xmlRes = await focusNfeRequest(`/v2/nfse/${encodeURIComponent(ref)}.xml`, 'GET');
-            return { success: true, data: xmlRes };
-        } catch(e) {
-            // Fallback: Tenta pegar o JSON normal
-            const result = await focusNfeRequest(`/v2/nfse/${encodeURIComponent(ref)}`, 'GET');
-            return { success: true, data: result };
+        // Tenta usar dados do snapshot se fornecidos (evita requisições extras)
+        let responseData = snapshot?.response_data || null;
+        let xmlPath = responseData?.caminho_xml_nota_fiscal || null;
+
+        if (!xmlPath) {
+            // Tenta obter o XML diretamente via API
+            try {
+                const xmlRes = await focusNfeRequest(`/v2/nfse/${encodeURIComponent(ref)}.xml`, 'GET');
+                return { success: true, data: xmlRes };
+            } catch (apiErr) {
+                console.warn(`[Focus NFe] API Direct fetch failed for "${ref}". Attempting database fallback...`);
+
+                const cookieStore = cookies();
+                const supabase = createServerClient(
+                    process.env.NEXT_PUBLIC_SUPABASE_URL,
+                    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+                    {
+                        cookies: {
+                            get(name) { return cookieStore.get(name)?.value; },
+                            set(name, value, options) { },
+                            remove(name, options) { },
+                        },
+                    }
+                );
+
+                // Busca no banco por REF ou por ID (caso o que veio seja o UUID)
+                const { data: nfse, error: dbError } = await supabase
+                    .from('nfse')
+                    .select('id, response_data')
+                    .or(`ref.eq."${ref}",id.eq."${ref}"`)
+                    .single();
+
+                if (dbError) {
+                    console.error(`[getXmlNFSeAction] DB Fallback error for "${ref}":`, dbError.message);
+                    throw apiErr; // Re-joga o erro da API se não achar no banco
+                }
+
+                responseData = nfse?.response_data;
+                xmlPath = responseData?.caminho_xml_nota_fiscal;
+            }
         }
+
+        if (xmlPath) {
+            console.log(`[getXmlNFSeAction] Fetching XML from specific path: ${xmlPath}`);
+            const xmlRes = await focusNfeRequest(xmlPath, 'GET');
+            return { success: true, data: xmlRes };
+        }
+
+        if (responseData) {
+            return { success: true, data: responseData };
+        }
+
+        return { success: false, error: 'Nota fiscal não encontrada no sistema ou na API.' };
+
     } catch (err) {
-        return { success: false, error: err.message };
+        console.error('[portal-contador] Erro ao baixar XML:', err.message);
+        return { success: false, error: err.message || 'Nota fiscal não encontrada.' };
     }
 }
+
 
 /**
  * Obter PDF da NFe (Base64) - Smart (Tenta NFe, depois NFCe)
@@ -1117,8 +1169,8 @@ export async function getPdfNFeAction(ref) {
                 return await downloadPdfFromUrl(result.caminho_danfe);
             }
         } catch (e) {
-             // Ignora erro NFe e tenta NFCe
-             // Se o erro for de conexão, vai falhar no próximo também.
+            // Ignora erro NFe e tenta NFCe
+            // Se o erro for de conexão, vai falhar no próximo também.
         }
 
         // Tentativa 2: NFCe (Fallback transparente)
@@ -1136,16 +1188,64 @@ export async function getPdfNFeAction(ref) {
 /**
  * Obter PDF da NFSe (Base64)
  */
-export async function getPdfNFSeAction(ref) {
+/**
+ * Obter PDF da NFSe (Base64)
+ */
+export async function getPdfNFSeAction(rawRef, snapshot = null) {
+    const ref = rawRef?.trim();
+    console.log(`[getPdfNFSeAction] Start for ref: "${ref}"`);
+
     try {
-        const result = await focusNfeRequest(`/v2/nfse/${encodeURIComponent(ref)}`, 'GET');
-        
-        const url = result.url_danfse || result.caminho_danfse || result.url;
-        if (url) {
-            return await downloadPdfFromUrl(url);
+        let pdfUrl = snapshot?.response_data?.url_danfse || snapshot?.response_data?.caminho_danfse || null;
+
+        if (!pdfUrl) {
+            try {
+                const result = await focusNfeRequest(`/v2/nfse/${encodeURIComponent(ref)}`, 'GET');
+                pdfUrl = result.url_danfse || result.caminho_danfse || result.url;
+            } catch (apiErr) {
+                console.warn(`[Focus NFe] API PDF fetch failed for "${ref}". Attempting database fallback...`);
+
+                const cookieStore = cookies();
+                const supabase = createServerClient(
+                    process.env.NEXT_PUBLIC_SUPABASE_URL,
+                    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+                    {
+                        cookies: {
+                            get(name) { return cookieStore.get(name)?.value; },
+                            set(name, value, options) { },
+                            remove(name, options) { },
+                        },
+                    }
+                );
+
+                const { data: nfse, error: dbError } = await supabase
+                    .from('nfse')
+                    .select('id, response_data')
+                    .or(`ref.eq."${ref}",id.eq."${ref}"`)
+                    .single();
+
+                if (dbError) {
+                    console.error(`[getPdfNFSeAction] DB Fallback error for "${ref}":`, dbError.message);
+                    throw apiErr;
+                }
+
+                if (nfse?.response_data) {
+                    console.log(`[getPdfNFSeAction] Found in DB! ID: ${nfse.id}`);
+                    pdfUrl = nfse.response_data.url_danfse || nfse.response_data.caminho_danfse;
+                }
+
+                if (!pdfUrl) throw apiErr;
+            }
         }
-        return { success: false, error: 'PDF não disponível' };
+
+        if (pdfUrl) {
+            console.log(`[getPdfNFSeAction] Downloading PDF from: ${pdfUrl}`);
+            return await downloadPdfFromUrl(pdfUrl);
+        }
+
+        return { success: false, error: 'PDF não disponível para esta nota.' };
     } catch (err) {
-        return { success: false, error: err.message };
+        console.error('[portal-contador] Erro ao baixar PDF:', err.message);
+        return { success: false, error: err.message || 'Nota fiscal não encontrada.' };
     }
 }
