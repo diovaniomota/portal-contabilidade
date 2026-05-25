@@ -1,8 +1,25 @@
 
 import { createBrowserClient } from '@supabase/ssr';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+let _supabase = null;
 
-// Use createBrowserClient instead of createClient to enable Cookie storage for Server Actions
-export const supabase = createBrowserClient(supabaseUrl, supabaseAnonKey);
+function getSupabase() {
+  if (_supabase) return _supabase;
+
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co';
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'placeholder-anon-key';
+
+  _supabase = createBrowserClient(supabaseUrl, supabaseAnonKey);
+  return _supabase;
+}
+
+export const supabase = new Proxy({}, {
+  get(_target, prop) {
+    const client = getSupabase();
+    const value = client[prop];
+    if (typeof value === 'function') {
+      return value.bind(client);
+    }
+    return value;
+  },
+});
